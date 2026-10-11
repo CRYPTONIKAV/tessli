@@ -1,6 +1,8 @@
 # Owner actions before Codex can continue
 
-These two items block parts of the v1.2 plan. Only the owner can complete them.
+**Both items are done** (2026-10-11). This file is kept as the record of the two decisions. The current owner to-do list is [Needs a human](progress-report.md#needs-a-human) in the progress report.
+
+These two items blocked parts of the v1.2 plan. Only the owner could complete them.
 
 ## 1. Mark the source triage (blocks Phase 1)
 

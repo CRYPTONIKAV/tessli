@@ -7,7 +7,7 @@ A short index of what lives in `docs/`. Start with the root [`README.md`](../REA
 - [`v1.2/plan.md`](v1.2/plan.md): the approved product and build plan.
 - [`v1.2/repo-cleanup.md`](v1.2/repo-cleanup.md): the cleanup steps (C0–C7).
 - [`v1.2/cleanup-report.md`](v1.2/cleanup-report.md): what Stage A removed and kept, with before/after counts.
-- [`v1.2/progress-report.md`](v1.2/progress-report.md): Stage B PRs, decisions, what is left and what needs a human.
+- [`v1.2/progress-report.md`](v1.2/progress-report.md): where each phase stands, the PRs, decisions, what is left, and the owner's to-do list.
 - [`v1.2/good-first-issues.md`](v1.2/good-first-issues.md): drafts of the first contributor issues, each with files, acceptance checks and how to verify.
 - [`v1.2/shadcn-directory-listing.md`](v1.2/shadcn-directory-listing.md): the `@tessli` entry for the shadcn registry directory, its pull request text and the pre-flight checklist.
 - [`v1.2/`](v1.2/): the catalogue audit, triage files and research notes behind the plan.
