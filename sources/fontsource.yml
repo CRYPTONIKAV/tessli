@@ -3,7 +3,7 @@ slug: fontsource
 name: Fontsource
 url: https://fontsource.org
 category: typography
-kind: asset
+kind: library
 access: open-source
 summary: Self-hostable open-source font packages for web projects
 status: active

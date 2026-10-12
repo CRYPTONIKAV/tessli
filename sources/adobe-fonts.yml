@@ -3,7 +3,7 @@ slug: adobe-fonts
 name: Adobe Fonts
 url: https://fonts.adobe.com
 category: typography
-kind: asset
+kind: library
 access: paid
 summary: Font library included with Adobe Creative Cloud subscriptions
 status: active
