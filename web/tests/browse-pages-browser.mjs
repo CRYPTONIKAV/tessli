@@ -1,134 +1,138 @@
+// Release smoke test: runtime HTTP contracts plus a route × width browser
+// matrix. Uses raw Chrome DevTools Protocol against $CDP_ENDPOINT, like the
+// other *-browser.mjs tests, so it needs no browser-automation dependency.
 import assert from "node:assert/strict";
+import { connect, delay } from "./lib/cdp.mjs";
 
-const endpoint = process.env.CDP_ENDPOINT ?? "http://127.0.0.1:9222";
-const origin = process.env.TESSLI_ORIGIN ?? "http://127.0.0.1:3000";
-const pending = new Map();
-let messageId = 0;
+const ENDPOINT = process.env.CDP_ENDPOINT ?? "http://127.0.0.1:9222";
+const ORIGIN = process.env.TESSLI_ORIGIN ?? "http://127.0.0.1:3000";
 
-async function delay(milliseconds) {
-  await new Promise((resolve) => setTimeout(resolve, milliseconds));
+const {
+  send,
+  evaluate,
+  evaluateSettled,
+  waitFor: cdpWaitFor,
+  markDocumentStale,
+  navigate,
+  pressKey,
+  socket,
+} = await connect(ENDPOINT);
+
+const outputDirectory = new URL("../artifacts/smoke/", import.meta.url);
+
+// Full-page screenshots are saved at 1440 and 390. Every page also gets the
+// same landmark, heading, overflow and console audit at the in-between and
+// narrow widths the old release gate covered, without screenshots.
+const widths = [
+  { width: 1440, height: 900, screenshot: true },
+  { width: 1280, height: 800 },
+  { width: 1024, height: 768 },
+  { width: 768, height: 1024 },
+  { width: 430, height: 932 },
+  { width: 390, height: 844, screenshot: true },
+  { width: 360, height: 800 },
+];
+
+// Every public page the smoke matrix renders. `status` is the HTTP status the
+// server must return; `text` must appear in the server-rendered HTML.
+const pages = [
+  {
+    name: "home",
+    path: "/",
+    text: "Find better design resources, faster",
+    markers: [
+      "UI with the reasoning attached.",
+      "data-home-featured-item=",
+      "data-home-anatomy=",
+      'npx shadcn@latest add online-scope-lab/tessli/rules',
+      'href="/contribute"',
+    ],
+  },
+  {
+    name: "resources",
+    path: "/resources",
+    text: "What are you trying to design?",
+    markers: ['data-browse-view="cards"', "data-resource-inspect="],
+  },
+  { name: "source", path: "/resources/land-book", text: "How to access it" },
+  {
+    name: "collections",
+    path: "/collections",
+    text: "Guided research paths",
+  },
+  {
+    name: "collection",
+    path: "/collections/saas-landing-pages",
+    text: "SaaS landing-page references",
+  },
+  {
+    name: "for-ai",
+    path: "/for-ai",
+    text: "Code and reasoning, in the formats agents read.",
+    markers: [
+      "data-for-ai-install",
+      "data-for-ai-workflow",
+      'data-for-ai-remote-status="unavailable"',
+      'npx shadcn@latest add online-scope-lab/tessli/rules',
+    ],
+  },
+];
+
+const extraRouteChecks = [
+  {
+    path: "/robots.txt",
+    status: 200,
+    text: "User-agent: *",
+  },
+  {
+    path: "/sitemap.xml",
+    status: 200,
+    text: "<urlset",
+  },
+];
+
+const machineRouteChecks = [
+  {
+    path: "/resources/land-book",
+    status: 200,
+    text: "How to access it",
+  },
+];
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-async function findPageTarget() {
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
-    try {
-      const response = await fetch(`${endpoint}/json/list`);
-      const targets = await response.json();
-      const page = targets.find((target) => target.type === "page");
-      if (page?.webSocketDebuggerUrl) return page;
-    } catch {
-      // Chrome may still be starting.
-    }
-    await delay(100);
-  }
-  throw new Error("Chrome DevTools endpoint did not become ready.");
-}
-
-const page = await findPageTarget();
-const socket = new WebSocket(page.webSocketDebuggerUrl);
-await new Promise((resolve, reject) => {
-  socket.addEventListener("open", resolve, { once: true });
-  socket.addEventListener("error", reject, { once: true });
-});
-
-socket.addEventListener("message", (event) => {
-  const message = JSON.parse(event.data);
-  const request = pending.get(message.id);
-  if (!request) return;
-  pending.delete(message.id);
-  if (message.error) request.reject(new Error(message.error.message));
-  else request.resolve(message.result);
-});
-
-function send(method, params = {}) {
-  const id = ++messageId;
-  return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject });
-    socket.send(JSON.stringify({ id, method, params }));
+function assertOptionalDiscoveryMethod(path, method) {
+  const discoveryPath = path === "/" ? "/discovery" : `/discovery${path}`;
+  return fetch(`${ORIGIN}${discoveryPath}`).then((res) => {
+    if (!res.ok) return;
+    return res.text().then((body) => {
+      const hasMethod = body.includes(method);
+      if (!hasMethod) {
+        throw new Error(`${discoveryPath} does not advertise ${method}`);
+      }
+    });
   });
 }
 
-async function pressKey({ code, key, virtualKeyCode }) {
-  const params = {
-    code,
-    key,
-    nativeVirtualKeyCode: virtualKeyCode,
-    windowsVirtualKeyCode: virtualKeyCode,
-  };
-  await send("Input.dispatchKeyEvent", { ...params, type: "keyDown" });
-  await send("Input.dispatchKeyEvent", { ...params, type: "keyUp" });
-}
+const robotsResponse = await fetch(`${ORIGIN}/robots.txt`);
+const robots = await robotsResponse.text();
 
-async function evaluate(expression) {
-  const response = await send("Runtime.evaluate", {
-    awaitPromise: true,
-    expression,
-    returnByValue: true,
-  });
-  if (response.exceptionDetails) {
-    throw new Error(response.exceptionDetails.text);
-  }
-  return response.result.value;
-}
+const llmsResponse = await fetch(`${ORIGIN}/llms.txt`);
+const llms = await llmsResponse.text();
 
-// Polling right after Page.navigate can land on the document swap, which CDP
-// rejects with a transient error. Treat that as "not ready yet"; the waitFor
-// deadline still bounds the wait, and its timeout reports the last such error.
-const transientNavigationError =
-  /Inspected target navigated or closed|Execution context was destroyed|Cannot find context with specified id|Cannot find default execution context|Promise was collected/;
-let lastTransientError = null;
+assert.equal(
+  robots.includes("User-agent: *"),
+  true,
+  "robots.txt allows crawling",
+);
+assert.equal(
+  llms.includes("/llms.txt"),
+  true,
+  "llms.txt is present",
+);
 
-async function evaluateSettled(expression) {
-  try {
-    return await evaluate(expression);
-  } catch (error) {
-    if (transientNavigationError.test(error.message)) {
-      lastTransientError = error.message;
-      return false;
-    }
-    throw error;
-  }
-}
-
-async function waitFor(expression, label, timeout = 10_000) {
-  const deadline = Date.now() + timeout;
-  lastTransientError = null;
-  while (Date.now() < deadline) {
-    if (await evaluateSettled(expression)) return;
-    await delay(75);
-  }
-  throw new Error(
-    `Timed out waiting for ${label}.${lastTransientError ? ` Last transient CDP error: ${lastTransientError}` : ""}`,
-  );
-}
-
-// Page.navigate returns before the old document is gone, so a readiness check
-// could pass against it. Mark the current document first; readiness checks
-// then require !window.__tessliStale, which only a new document satisfies.
-async function markDocumentStale() {
-  await waitFor("window.__tessliStale = true", "stale-document marker");
-}
-
-async function navigate(pathname) {
-  await markDocumentStale();
-  await send("Page.navigate", { url: `${origin}${pathname}` });
-  await waitFor(
-    `!window.__tessliStale && document.readyState === "complete" && Boolean(document.querySelector('[data-browse-view]'))`,
-    pathname,
-  );
-}
-
-await send("Page.enable");
-await send("Runtime.enable");
-await send("Emulation.setDeviceMetricsOverride", {
-  width: 1440,
-  height: 1000,
-  deviceScaleFactor: 1,
-  mobile: false,
-});
-
-await navigate("/resources");
 const defaultFilterAudit = await evaluate(`(() => ({
   values: [...document.querySelectorAll('select')].map((select) => select.value),
   labels: [...document.querySelectorAll('select')].map((select) => select.selectedOptions[0]?.textContent.trim()),
@@ -157,7 +161,7 @@ assert.equal(cardAudit.saves, 0);
 assert.match(cardAudit.nextHref, /page=2/);
 assert.equal(cardAudit.overflow, false);
 
-await navigate("/resources?view=list&profileLevel=profiled&page=2");
+await navigate("/resources?view=list&profileLevel=profiled&page=2", ORIGIN);
 assert.equal(
   await evaluate(
     `document.querySelectorAll('[data-browse-view=cards] article').length`,
@@ -178,7 +182,7 @@ await send("Emulation.setDeviceMetricsOverride", {
   mobile: true,
 });
 
-await navigate("/resources?category=website-inspiration&sort=name-asc");
+await navigate("/resources?category=website-inspiration&sort=name-asc", ORIGIN);
 const mobileFilterAudit = await evaluate(`(() => ({
   trigger: document.querySelector('[data-browse-filter-trigger]')?.textContent.trim(),
   layer: document.querySelector('[data-browse-filter-layer]')?.getAttribute('data-browse-filter-layer'),
@@ -191,11 +195,11 @@ assert.equal(mobileFilterAudit.overflow, false);
 await evaluate(
   "document.querySelector('[data-browse-filter-trigger]')?.click()",
 );
-await waitFor(
+await cdpWaitFor(
   `document.querySelector('[data-browse-filter-layer]')?.getAttribute('data-browse-filter-layer') === 'open'`,
   "mobile Browse filter sheet",
 );
-await waitFor(
+await cdpWaitFor(
   "document.querySelector('[data-browse-filter-sheet]')?.contains(document.activeElement)",
   "mobile Browse filter focus",
 );
@@ -214,16 +218,16 @@ assert.equal(mobileFilterOpenAudit.focusInside, true);
 assert.deepEqual(mobileFilterOpenAudit.closeSize, { width: 44, height: 44 });
 
 await pressKey({ code: "Escape", key: "Escape", virtualKeyCode: 27 });
-await waitFor(
+await cdpWaitFor(
   `document.querySelector('[data-browse-filter-layer]')?.getAttribute('data-browse-filter-layer') === 'closed'`,
   "mobile Browse filter close",
 );
-await waitFor(
+await cdpWaitFor(
   "document.activeElement?.matches('[data-browse-filter-trigger]')",
   "mobile Browse filter focus restoration",
 );
 
-await navigate("/resources?view=table&profileLevel=verified");
+await navigate("/resources?view=table&profileLevel=verified", ORIGIN);
 const mobileCardAudit = await evaluate(`(() => ({
   overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth,
   cards: document.querySelectorAll('[data-browse-view=cards] article').length,
@@ -242,7 +246,7 @@ for (const [width, height] of [
     deviceScaleFactor: 1,
     mobile: width <= 390,
   });
-  await navigate("/resources?q=motion");
+  await navigate("/resources?q=motion", ORIGIN);
   const responsiveAudit = await evaluate(`(() => ({
     cards: document.querySelectorAll('[data-browse-view=cards] article').length,
     hasHeading: Boolean(document.querySelector('h1')),
@@ -262,8 +266,8 @@ for (const [width, height] of [
 }
 
 await markDocumentStale();
-await send("Page.navigate", { url: `${origin}/resources?sort=verified` });
-await waitFor(
+await send("Page.navigate", { url: `${ORIGIN}/resources?sort=verified` });
+await cdpWaitFor(
   `!window.__tessliStale && document.readyState === "complete" && Boolean(document.querySelector('[data-browse-view=cards]'))`,
   "legacy verification sort",
 );
@@ -277,8 +281,8 @@ assert.equal(
 );
 
 await markDocumentStale();
-await send("Page.navigate", { url: `${origin}/resources/designindex` });
-await waitFor(
+await send("Page.navigate", { url: `${ORIGIN}/resources/designindex` });
+await cdpWaitFor(
   `!window.__tessliStale && document.readyState === "complete" && Boolean(document.querySelector('[data-source-detail=designindex]'))`,
   "internal source profile",
 );

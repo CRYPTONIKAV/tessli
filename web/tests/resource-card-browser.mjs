@@ -1,24 +1,30 @@
+// Resource card: hover, selection, overflow, independent-action, media fallback.
 import assert from "node:assert/strict";
+import { connect, delay } from "./lib/cdp.mjs";
 
-const endpoint = process.env.CDP_ENDPOINT ?? "http://127.0.0.1:9222";
+const ENDPOINT = process.env.CDP_ENDPOINT ?? "http://127.0.0.1:9222";
 const browseUrl =
   process.env.TESSLI_BROWSE_URL ?? "http://127.0.0.1:3000/resources";
-const pending = new Map();
-let messageId = 0;
+const firstCard = "[data-browse-view=cards] [data-resource-card]";
 
-async function delay(milliseconds) {
-  await new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
+const {
+  send,
+  evaluate,
+  evaluateSettled,
+  waitFor: cdpWaitFor,
+  markDocumentStale,
+  navigate,
+  socket,
+} = await connect(ENDPOINT);
 
 async function pageTargets() {
-  const response = await fetch(`${endpoint}/json/list`);
+  const response = await fetch(`${ENDPOINT}/json/list`);
   const targets = await response.json();
   return targets.filter((target) => target.type === "page");
 }
 
 async function findPageTarget() {
   const deadline = Date.now() + 10_000;
-
   while (Date.now() < deadline) {
     try {
       const page = (await pageTargets())[0];
@@ -28,108 +34,10 @@ async function findPageTarget() {
     } catch {
       // Chrome may still be starting.
     }
-
     await delay(100);
   }
-
   throw new Error("Chrome DevTools endpoint did not become ready.");
 }
-
-const page = await findPageTarget();
-const socket = new WebSocket(page.webSocketDebuggerUrl);
-
-await new Promise((resolve, reject) => {
-  socket.addEventListener("open", resolve, { once: true });
-  socket.addEventListener("error", reject, { once: true });
-});
-
-socket.addEventListener("message", (event) => {
-  const message = JSON.parse(event.data);
-  const request = pending.get(message.id);
-
-  if (!request) {
-    return;
-  }
-
-  pending.delete(message.id);
-  if (message.error) {
-    request.reject(new Error(message.error.message));
-  } else {
-    request.resolve(message.result);
-  }
-});
-
-function send(method, params = {}) {
-  const id = ++messageId;
-
-  return new Promise((resolve, reject) => {
-    pending.set(id, { reject, resolve });
-    socket.send(JSON.stringify({ id, method, params }));
-  });
-}
-
-async function evaluate(expression) {
-  const response = await send("Runtime.evaluate", {
-    awaitPromise: true,
-    expression,
-    returnByValue: true,
-  });
-
-  if (response.exceptionDetails) {
-    throw new Error(
-      response.exceptionDetails.exception?.description ??
-        response.exceptionDetails.text ??
-        "Browser evaluation failed.",
-    );
-  }
-
-  return response.result.value;
-}
-
-// Polling right after Page.navigate can land on the document swap, which CDP
-// rejects with a transient error. Treat that as "not ready yet"; the waitFor
-// deadline still bounds the wait, and its timeout reports the last such error.
-const transientNavigationError =
-  /Inspected target navigated or closed|Execution context was destroyed|Cannot find context with specified id|Cannot find default execution context|Promise was collected/;
-let lastTransientError = null;
-
-async function evaluateSettled(expression) {
-  try {
-    return await evaluate(expression);
-  } catch (error) {
-    if (transientNavigationError.test(error.message)) {
-      lastTransientError = error.message;
-      return false;
-    }
-    throw error;
-  }
-}
-
-async function waitFor(expression, label, timeout = 7_500) {
-  const deadline = Date.now() + timeout;
-  lastTransientError = null;
-
-  while (Date.now() < deadline) {
-    if (await evaluateSettled(expression)) {
-      return;
-    }
-
-    await delay(50);
-  }
-
-  throw new Error(
-    `Timed out waiting for ${label}.${lastTransientError ? ` Last transient CDP error: ${lastTransientError}` : ""}`,
-  );
-}
-
-// Page.navigate returns before the old document is gone, so a readiness check
-// could pass against it. Mark the current document first; readiness checks
-// then require !window.__tessliStale, which only a new document satisfies.
-async function markDocumentStale() {
-  await waitFor("window.__tessliStale = true", "stale-document marker");
-}
-
-const firstCard = "[data-browse-view=cards] [data-resource-card]";
 
 async function revealFirstCard() {
   await evaluate(`(() => {
@@ -158,22 +66,56 @@ async function hoverFirstCard() {
   });
 }
 
+const transientNavigationError =
+  /Inspected target navigated or closed|Execution context was destroyed|Cannot find context with specified id|Cannot find default execution context|Promise was collected/;
+let lastTransientError = null;
+
+async function evaluateSettledLocal(expression) {
+  try {
+    return await evaluate(expression);
+  } catch (error) {
+    if (transientNavigationError.test(error.message)) {
+      lastTransientError = error.message;
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function waitForLocal(expression, label, timeout = 7_500) {
+  const deadline = Date.now() + timeout;
+  lastTransientError = null;
+  while (Date.now() < deadline) {
+    if (await evaluateSettledLocal(expression)) {
+      return;
+    }
+    await delay(50);
+  }
+  throw new Error(
+    `Timed out waiting for ${label}.${lastTransientError ? ` Last transient CDP error: ${lastTransientError}` : ""}`,
+  );
+}
+
+async function markDocumentStaleLocal() {
+  await waitForLocal("window.__tessliStale = true", "stale-document marker");
+}
+
 await send("Page.enable");
 await send("Runtime.enable");
-await markDocumentStale();
+await markDocumentStaleLocal();
 await send("Page.navigate", { url: browseUrl });
-await waitFor(
+await cdpWaitFor(
   `!window.__tessliStale && document.readyState === "complete" && document.querySelectorAll("${firstCard}").length > 0`,
   "profile-linked Browse cards",
 );
 
 await revealFirstCard();
 await hoverFirstCard();
-await waitFor(
+await waitForLocal(
   `getComputedStyle(document.querySelector("${firstCard}")).transform !== "none"`,
   "the card hover lift",
 );
-await waitFor(
+await waitForLocal(
   `getComputedStyle(document.querySelector("${firstCard}"), "::before").backgroundSize.includes("100% 1px")`,
   "the card hover border trace",
 );
@@ -208,7 +150,6 @@ assert.equal(
     const cards = Array.from(
       document.querySelectorAll('[data-browse-view=cards] [data-resource-card]'),
     );
-
     return cards.every((card) => {
       const inspect = card.querySelector('a[data-resource-inspect]');
       const primary = card.querySelector(':scope > a[data-resource-profile-link]');
@@ -219,7 +160,6 @@ assert.equal(
         ? !visit && /Archived/.test(card.textContent)
         : visit?.getAttribute('target') === '_blank' &&
           visit?.getAttribute('rel') === 'noopener noreferrer';
-
       return Boolean(
         inspect &&
           primary?.getAttribute('href')?.startsWith('/resources/') &&
@@ -268,7 +208,7 @@ while (observedStates.at(-1) !== "generated") {
   await evaluate(
     `${mediaCard}.querySelector('img')?.dispatchEvent(new Event('error'))`,
   );
-  await waitFor(
+  await waitForLocal(
     `${mediaCard}.getAttribute('data-media-state') !== '${previous}'`,
     `the media fallback to advance past ${previous}`,
   );
