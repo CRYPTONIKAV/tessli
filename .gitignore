@@ -20,3 +20,8 @@ bench/runs/*
 bench/starter/node_modules/
 bench/starter/.next/
 bench/starter/next-env.d.ts
+
+# ECC Loop Solver (Fase 2)
+.knowledge/solver/
+.knowledge/optmem/
+.knowledge/orchestration/
